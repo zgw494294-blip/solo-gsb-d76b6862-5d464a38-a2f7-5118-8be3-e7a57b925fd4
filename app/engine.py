@@ -23,6 +23,12 @@ filters (predicate references and the passed-through columns), while
 projection output names and join aliases are the boundary where the change
 stops (copy/key/output ``column`` references are still rewritten to keep
 pointing at the same original columns).
+
+``compose`` splices one graph's export into another graph's source position:
+the downstream source node is replaced in place by a single projection that
+copies the mapped upstream export columns, and the upstream export together
+with its dependency ancestors is appended (ids renamed where they collide).
+Provenance at the replacement position is taken from the upstream graph.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from collections import defaultdict, deque
 from typing import Union
 
 from .models import (
+    ComposeRequest,
     FilterNodeIn,
     JoinNodeIn,
     ProjectionNodeIn,
@@ -1051,4 +1058,185 @@ def rename(request: RenameRequest) -> dict[str, object]:
             {"from": old, "to": new} for old, new in old_to_new.items()
         ],
         "review": renamed_review,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Composing an upstream export into a downstream source position
+# ---------------------------------------------------------------------------
+
+
+def _fresh_upstream_id(old_id: str, used: set[str]) -> str:
+    """Pick a deterministic graph-unique id for a conflicting upstream node."""
+    candidate = f"{old_id}__upstream"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{old_id}__upstream_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def compose(request: ComposeRequest) -> dict[str, object]:
+    """Splice an upstream graph's export into a downstream source position.
+
+    Both whole graphs are validated under exactly the same rules as
+    :func:`review` before anything is composed. The named downstream node
+    must exist and be a source; the mapping must cover every one of its
+    columns exactly (no missing, no extra entries — several source columns
+    may draw from the same upstream export column) and every referenced
+    upstream column must exist on the upstream export node's relation.
+
+    The source is replaced *in place* by a single projection that keeps the
+    original source id and copies the mapped upstream export columns in the
+    source's original column order, so every downstream branch reference
+    stays valid; all other downstream nodes are untouched. Only the upstream
+    export and its dependency ancestors are appended, in the upstream nodes'
+    original order and with their original column definitions. Upstream node
+    ids colliding with a downstream id are renamed to graph-unique ids (all
+    input references updated); the old->new id map of every introduced node
+    is returned.
+
+    Content provenance and row-level influence at the replacement position
+    come from the upstream graph — the replaced source's ``sensitive`` flags
+    do not survive. The two input graphs are never modified. The composed
+    graph is re-validated and re-reviewed under the original rules (reasons
+    therefore use the composed graph's ids); when it would exceed the
+    60-node limit the whole request is rejected without any partial graph.
+    """
+    down_by_id, _down_order, _down_relations = _evaluate_graph(request.downstream)
+    up_by_id, _up_order, up_relations = _evaluate_graph(request.upstream)
+
+    source_node = down_by_id.get(request.source)
+    if not isinstance(source_node, SourceNodeIn):
+        raise ValidationError(
+            "COMPOSE_SOURCE_NOT_FOUND",
+            f"source node '{request.source}' does not exist or is not a "
+            "source node",
+            request.source,
+        )
+
+    # The mapping must cover exactly the source's columns: no source column
+    # left unmapped, no entry naming a column the source does not have.
+    source_columns = [c.name for c in source_node.columns]
+    source_column_set = set(source_columns)
+    mapped = {item.column: item.upstream_column for item in request.mapping}
+    missing = [name for name in source_columns if name not in mapped]
+    extra = [
+        item.column for item in request.mapping if item.column not in source_column_set
+    ]
+    if missing or extra:
+        raise ValidationError(
+            "COMPOSE_MAPPING_MISMATCH",
+            "the mapping must cover every column of source node "
+            f"'{request.source}' exactly once",
+            request.source,
+            {"missing": missing, "extra": extra},
+        )
+
+    # Every referenced column must resolve on the upstream export relation
+    # (for a filter export that is the passed-through input columns).
+    up_export_columns = {
+        c.name for c in up_relations[request.upstream.export].columns
+    }
+    unknown: list[str] = []
+    for item in request.mapping:
+        if (
+            item.upstream_column not in up_export_columns
+            and item.upstream_column not in unknown
+        ):
+            unknown.append(item.upstream_column)
+    if unknown:
+        raise ValidationError(
+            "COMPOSE_COLUMN_NOT_FOUND",
+            "mapped column(s) not found on upstream export node "
+            f"'{request.upstream.export}': " + ", ".join(unknown),
+            request.upstream.export,
+            {"columns": unknown},
+        )
+
+    # --- introduced nodes: the upstream export and its dependency ancestors,
+    # in the upstream request's original node order --------------------------
+    keep = _ancestors(request.upstream.export, up_by_id)
+    introduced = [node for node in request.upstream.nodes if node.id in keep]
+
+    # --- id assignment: keep non-conflicting ids, rename the rest -----------
+    # ``used`` is pre-seeded with every downstream id and every introduced
+    # old id, so a freshly minted id can never collide with a node kept
+    # as-is that is only processed later.
+    downstream_ids = set(down_by_id)
+    used = downstream_ids | {node.id for node in introduced}
+    id_map: dict[str, str] = {}
+    for node in introduced:
+        if node.id not in downstream_ids:
+            id_map[node.id] = node.id
+        else:
+            id_map[node.id] = _fresh_upstream_id(node.id, used)
+            used.add(id_map[node.id])
+
+    introduced_dicts: list[dict[str, object]] = []
+    for node in introduced:
+        data = serialize_node(node)
+        data["id"] = id_map[node.id]
+        if isinstance(node, (ProjectionNodeIn, FilterNodeIn)):
+            data["input"] = id_map[node.input]
+        elif isinstance(node, JoinNodeIn):
+            data["left_input"] = id_map[node.left_input]
+            data["right_input"] = id_map[node.right_input]
+        introduced_dicts.append(data)
+
+    # --- the replacement projection: original source id, original column
+    # order, each column copying its mapped upstream export column ----------
+    projection = {
+        "id": request.source,
+        "type": "projection",
+        "input": id_map[request.upstream.export],
+        "columns": [
+            {"name": name, "copy": mapped[name]} for name in source_columns
+        ],
+    }
+
+    # Downstream nodes keep their order with the source replaced in place;
+    # the introduced upstream nodes are appended after them.
+    composed: list[dict[str, object]] = []
+    for node in request.downstream.nodes:
+        if node.id == request.source:
+            composed.append(projection)
+        else:
+            composed.append(serialize_node(node))
+    composed.extend(introduced_dicts)
+
+    if len(composed) > NODE_LIMIT:
+        raise ValidationError(
+            "COMPOSE_NODE_LIMIT",
+            f"the composed graph would exceed the {NODE_LIMIT}-node limit "
+            f"({len(request.downstream.nodes)} downstream nodes plus "
+            f"{len(introduced)} introduced nodes make {len(composed)})",
+            request.downstream.export,
+            {"node_count": len(composed), "limit": NODE_LIMIT},
+        )
+
+    # Re-validate and re-review the composed graph under the original rules;
+    # reasons in the review therefore use the composed graph's ids.
+    re_payload = ReviewRequest.model_validate(
+        {"nodes": composed, "export": request.downstream.export}
+    )
+    try:
+        composed_review = review(re_payload)
+    except ValidationError as exc:  # pragma: no cover - invariant by construction
+        raise ValidationError(
+            "COMPOSE_INVALID_RESULT",
+            "internal error: the composed graph fails validation under the "
+            "original rules: " + exc.message,
+            request.downstream.export,
+            {"underlying": exc.detail()},
+        )
+
+    return {
+        "nodes": composed,
+        "export": request.downstream.export,
+        "source": request.source,
+        "id_map": [
+            {"from": old_id, "to": new_id} for old_id, new_id in id_map.items()
+        ],
+        "review": composed_review,
     }

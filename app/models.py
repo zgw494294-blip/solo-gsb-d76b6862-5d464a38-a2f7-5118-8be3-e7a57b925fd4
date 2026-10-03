@@ -176,6 +176,56 @@ class RenameRequest(StrictModel):
         return self
 
 
+class ColumnMappingIn(StrictModel):
+    """One downstream source column fed by an upstream export column.
+
+    ``column`` names a column of the replaced downstream source node; ``from``
+    names the column of the upstream export node whose values take its place
+    (a Python keyword-free alias is not needed for ``column``, while ``from``
+    is aliased onto ``from_`` like ``copy`` is for projections). Several
+    source columns may legitimately draw from the same upstream column.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    column: str = Field(min_length=1)
+    from_: str = Field(alias="from", min_length=1)
+
+    @property
+    def upstream_column(self) -> str:
+        return self.from_
+
+
+class ComposeRequest(StrictModel):
+    """Two review-shaped graphs plus the splice point and column mapping.
+
+    ``downstream`` and ``upstream`` are each a whole graph with its export
+    node, validated by exactly the same rules as ``ReviewRequest``. ``source``
+    names the downstream source node to replace; ``mapping`` lists, for every
+    column of that source, the upstream export column feeding it. The mapping
+    must cover every source column exactly once (duplicates are a schema
+    error); coverage, extra entries and the existence of the referenced
+    upstream columns are checked in the engine together with the graphs.
+    """
+
+    downstream: ReviewRequest
+    upstream: ReviewRequest
+    source: str = Field(min_length=1)
+    mapping: list[ColumnMappingIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _mapped_columns_distinct(self) -> "ComposeRequest":
+        seen: set[str] = set()
+        for item in self.mapping:
+            if item.column in seen:
+                raise ValueError(
+                    f"mapping for source column '{item.column}' is listed more "
+                    "than once"
+                )
+            seen.add(item.column)
+        return self
+
+
 class PruneRequest(StrictModel):
     """A review request plus the export columns the caller wants to keep.
 

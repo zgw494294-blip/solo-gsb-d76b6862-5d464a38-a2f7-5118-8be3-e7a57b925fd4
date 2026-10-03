@@ -20,6 +20,11 @@
 原来的列（筛选引用随输入改名并继续透传；投影 `copy`、连接键与输出引用随各自输入改名，投影
 输出名与连接别名不变）。不增删任何节点或列，复审阻断结论不变，详见下文“源列批量改名”。
 
+最后提供 `POST /api/compose`：把**上游加工图的导出**接到**下游图的源位置**，生成一张可复审的
+合成图——被替换的源**原位**变成一个沿用原源 ID 的一层投影，按源列原序 `copy` 映射的上游导出列；
+只追加上游导出及其全部依赖祖先（沿用上游节点原序与列定义，ID 冲突自动改成全图唯一 ID），
+替换位置的内容与行影响取自上游，详见下文“拼接上游导出”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -607,6 +612,152 @@ curl -s -i -X POST http://localhost:8080/api/rename \
 `renames` 为空/缺失、`from` 重复或为空字符串、`to` 为空、未知字段、节点超过 60 等 schema
 问题返回 HTTP 422。
 
+## 拼接上游导出：POST /api/compose
+
+把**上游加工图的导出节点**接到**下游图的某个源节点位置**，合成一张可直接复审的完整图。
+请求体包含两份**各自完整**的审查请求（`downstream` 与 `upstream`，均为 `nodes` + `export`，
+各自 1–60 个节点）、待替换的下游源节点 ID `source`，以及该源**每一列**到上游导出列的对应表
+`mapping`（每项 `{"column": "下游源列", "from": "上游导出列"}`）。两张整图都先按 `/api/review`
+的原规则校验，原有错误行为不变。
+
+### 拼接规则
+
+1. **映射约束**：`mapping` 必须**恰好覆盖**被替换源的全部列——无缺漏、无多余项；允许**多列
+   引用同一上游列**；`mapping` 的列出顺序不影响结果（结果列序一律沿用源列原序）。每个 `from`
+   都必须存在于上游导出节点的实际输出列上（filter 导出的输出列即其透传的输入列）。
+2. **原位替换**：被替换的源节点变成一个**一层投影**：沿用**原源 ID**，输入为上游导出节点，
+   按**源列原序**逐列 `copy` 映射的上游导出列。下游其余节点一律不动；由于投影暴露的列名与
+   原源完全一致，下游**所有分支**（含非导出分支）的引用继续有效。
+3. **引入上游**：只追加**上游导出节点及其全部依赖祖先**（按上游请求中的节点原序、列定义
+   原样保留）；上游中导出不可达的节点不引入。
+4. **ID 冲突**：上游节点 ID 与下游冲突时改成全图唯一 ID（形如 `<原ID>__upstream`，仍冲突时
+   追加序号），并同步更新引入节点的全部输入引用；响应的 `id_map` 按上游节点原序列出**全部
+   引入节点**的旧新 ID 映射（未改名者 `from` 与 `to` 相同）。
+5. **来源语义**：替换位置的**内容来源与行影响完全取自上游**（投影继承上游导出列的内容来源
+   与上游关系的行影响）；被替换源的 `sensitive` 标记**不保留**——原敏感列改由干净的上游列喂
+   数后即不再阻断，反之上游的敏感来源会顺流阻断下游导出列。
+6. **不修改输入**：两份输入图不会被修改；响应中的图是全新构造的。
+7. **复审**：合成图按原规则重新校验并复审（导出仍为**原下游 export**），`review` 中的原因
+   使用**合成图 ID**（即改名后的上游节点 ID）。
+
+### 拒绝（HTTP 400，不返回部分图）
+
+* `source` 不存在或不是源节点：`COMPOSE_SOURCE_NOT_FOUND`；
+* 映射未恰好覆盖源的全部列（缺漏列入 `missing`、多余列入 `extra`）：`COMPOSE_MAPPING_MISMATCH`；
+* 映射引用的列在上游导出节点上不存在：`COMPOSE_COLUMN_NOT_FOUND`；
+* 合成后节点数**超过 60**：`COMPOSE_NODE_LIMIT`；
+* 任一整图的原校验错误（`DUPLICATE_NODE` / `COLUMN_CONFLICT` / `INVALID_REFERENCE` / `CYCLE`）
+  ——两张图都先整图校验，无关分支的错误同样拒绝。
+
+`mapping` 为空或缺失、`column` 重复或为空字符串、`from` 为空、未知字段、任一图节点数超过
+60 等 schema 问题返回 HTTP 422。
+
+成功响应包含：完整 `nodes`（合成图）、原下游 `export`、`source`、全部引入节点的 `id_map`，
+以及用原规则对合成图**复审**的 `review`。
+
+### 拼接并用 POST /api/review 复审（可直接执行）
+
+```bash
+# 1) 发起拼接（示例文件：把已脱敏的上游导出 safe_users 接到下游 users 源位置）
+curl -s -X POST http://localhost:8080/api/compose \
+  -H 'Content-Type: application/json' \
+  --data @examples/compose_request.json
+```
+
+返回（节选）：下游源 `users` 原位变为一层投影（输入为上游导出 `safe_users`，按源列原序
+`copy` 映射列）；上游导出及其祖先 `raw_users`、`safe_users` 追加在图尾；被替换源的
+`email` 敏感标记不保留——`mail` 改由上游常量列喂数，复审判安全：
+
+```json
+{
+  "nodes": [
+    {"id": "users", "type": "projection", "input": "safe_users", "columns": [
+      {"name": "uid", "copy": "uid"},
+      {"name": "email", "copy": "mail"},
+      {"name": "country", "copy": "country"}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn", "columns": [
+      {"name": "user_id", "copy": "uid"},
+      {"name": "mail", "copy": "email"},
+      {"name": "bucket", "constant": "ALL"}]},
+    {"id": "raw_users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email_hash", "sensitive": true},
+      {"name": "country", "sensitive": false}]},
+    {"id": "safe_users", "type": "projection", "input": "raw_users", "columns": [
+      {"name": "uid", "copy": "uid"},
+      {"name": "mail", "constant": null},
+      {"name": "country", "copy": "country"}]}
+  ],
+  "export": "export_users",
+  "source": "users",
+  "id_map": [
+    {"from": "raw_users", "to": "raw_users"},
+    {"from": "safe_users", "to": "safe_users"}],
+  "review": {"export": "export_users", "blocked": false, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "mail", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+```bash
+# 2) 用原审查接口 POST /api/review 复审返回的合成图（需要 jq；应与响应内 review 一致）
+curl -s -X POST http://localhost:8080/api/compose \
+  -H 'Content-Type: application/json' \
+  --data @examples/compose_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+```
+
+上游节点 ID 与下游冲突时自动改名，复审原因使用合成图 ID。下例上游源也叫 `users`，引入后
+改名为 `users__upstream`，其敏感列 `mail` 顺流阻断下游导出列，原因指向改名后的节点：
+
+```bash
+curl -s -X POST http://localhost:8080/api/compose \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "downstream": {
+    "nodes": [
+      {"id": "users", "type": "source",
+       "columns": [{"name": "uid"}, {"name": "email", "sensitive": true},
+                   {"name": "country"}]},
+      {"id": "export_users", "type": "projection", "input": "users",
+       "columns": [{"name": "mail", "copy": "email"}]}
+    ],
+    "export": "export_users"
+  },
+  "upstream": {
+    "nodes": [
+      {"id": "users", "type": "source",
+       "columns": [{"name": "uid"}, {"name": "mail", "sensitive": true},
+                   {"name": "country"}]}
+    ],
+    "export": "users"
+  },
+  "source": "users",
+  "mapping": [
+    {"column": "uid", "from": "uid"},
+    {"column": "email", "from": "mail"},
+    {"column": "country", "from": "country"}
+  ]
+}'
+# id_map 为 [{"from":"users","to":"users__upstream"}]；
+# review.columns[0].content_reasons 为 [{"node_id":"users__upstream","column":"mail"}]
+```
+
+映射未覆盖全部源列（或含多余项）、映射列不存在、目标非源、合成后超过 60 节点时整次拒绝，
+不返回部分图：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/compose \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.mapping = [.mapping[0]]' examples/compose_request.json)"
+# HTTP/1.1 400 ... {"error":{"code":"COMPOSE_MAPPING_MISMATCH", ...
+#   "missing":["email","country"],"extra":[]}}
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -642,11 +793,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest 与 RenameRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简与源列批量改名
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简与改名测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest 与 ComposeRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名与上下游拼接
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名与拼接测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```
