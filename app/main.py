@@ -3,8 +3,14 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .engine import ValidationError, prune, rename, review, revise
-from .models import PruneRequest, RenameRequest, ReviewRequest, ReviseRequest
+from .engine import ValidationError, prune, rename, review, revise, stitch
+from .models import (
+    PruneRequest,
+    RenameRequest,
+    ReviewRequest,
+    ReviseRequest,
+    StitchRequest,
+)
 
 app = FastAPI(
     title="Local Data Export Risk Review API",
@@ -12,11 +18,13 @@ app = FastAPI(
         "Reviews every output column of an export node for sensitive content "
         "provenance and sensitive row-level influence, can revise a blocked "
         "graph into a re-submittable, review-safe export, can prune a graph "
-        "down to a chosen subset of export columns, and can batch-rename "
-        "columns of a source node while keeping every in-graph reference "
-        "pointing at the same original columns."
+        "down to a chosen subset of export columns, can batch-rename columns "
+        "of a source node while keeping every in-graph reference pointing at "
+        "the same original columns, and can stitch an upstream graph's export "
+        "into a downstream source position to produce a reviewable composite "
+        "graph."
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -57,3 +65,8 @@ async def prune_export(request: PruneRequest) -> dict[str, object]:
 @app.post("/api/rename")
 async def rename_source_columns(request: RenameRequest) -> dict[str, object]:
     return rename(request)
+
+
+@app.post("/api/stitch")
+async def stitch_graphs(request: StitchRequest) -> dict[str, object]:
+    return stitch(request)

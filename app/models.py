@@ -200,3 +200,59 @@ class PruneRequest(StrictModel):
                 )
             seen.add(name)
         return self
+
+
+class StitchMappingIn(StrictModel):
+    """One correspondence between a downstream source column and an upstream
+    export column.
+
+    The JSON field naming mirrors :class:`ColumnRenameIn` (``from`` is a Python
+    keyword, aliased onto ``from_``): ``from`` names a column of the replaced
+    downstream source in its original order, ``to`` names the upstream export
+    column whose content feeds it. Several entries may point ``to`` the same
+    upstream column; duplicate ``from`` values are rejected (see
+    :class:`StitchRequest`).
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_: str = Field(alias="from", min_length=1)
+    to: str = Field(min_length=1)
+
+    @property
+    def source_name(self) -> str:
+        return self.from_
+
+    @property
+    def upstream_name(self) -> str:
+        return self.to
+
+
+class StitchRequest(StrictModel):
+    """Two whole graphs plus a source replacement and its column correspondence.
+
+    Both ``upstream`` and ``downstream`` are ordinary review requests, so each
+    whole graph keeps the original validation (including its own 60-node cap).
+    ``source`` selects one downstream source node to replace in place, and
+    ``mapping`` must list exactly the source node's columns, once each, each
+    pointing at an existing upstream export column; multiple source columns may
+    reference the same upstream column. Exact coverage (no missing, no extra)
+    and target-column existence are checked in the engine.
+    """
+
+    upstream: ReviewRequest
+    downstream: ReviewRequest
+    source: str = Field(min_length=1)
+    mapping: list[StitchMappingIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _source_columns_listed_once(self) -> "StitchRequest":
+        seen: set[str] = set()
+        for item in self.mapping:
+            if item.source_name in seen:
+                raise ValueError(
+                    f"mapping for source column '{item.source_name}' is listed "
+                    "more than once"
+                )
+            seen.add(item.source_name)
+        return self

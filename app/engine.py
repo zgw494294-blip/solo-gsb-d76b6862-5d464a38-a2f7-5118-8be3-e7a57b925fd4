@@ -23,6 +23,14 @@ filters (predicate references and the passed-through columns), while
 projection output names and join aliases are the boundary where the change
 stops (copy/key/output ``column`` references are still rewritten to keep
 pointing at the same original columns).
+
+``stitch`` connects an upstream graph's export to a downstream graph's source
+position: the named downstream source is replaced in place by a one-layer
+projection copying the mapped upstream export columns, and the upstream export
+with all of its dependency ancestors is appended (only those, in upstream
+order). Clashing upstream ids become globally unique ids and every imported
+input reference is rewritten, so all downstream branches keep working. The
+returned review therefore reasons in synthetic graph ids.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ from .models import (
     ReviewRequest,
     ReviseRequest,
     SourceNodeIn,
+    StitchRequest,
 )
 
 # Hard cap shared with the request models: a revised graph may never exceed it.
@@ -1051,4 +1060,184 @@ def rename(request: RenameRequest) -> dict[str, object]:
             {"from": old, "to": new} for old, new in old_to_new.items()
         ],
         "review": renamed_review,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stitching an upstream graph into a downstream source position
+# ---------------------------------------------------------------------------
+
+
+def _safe_imported_id(old_id: str, used: set[str]) -> str:
+    """Pick a deterministic, globally unique id for an imported upstream node."""
+    candidate = f"{old_id}__up"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{old_id}__up_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def stitch(request: StitchRequest) -> dict[str, object]:
+    """Connect an upstream graph's export to a downstream source position.
+
+    Both whole graphs are validated under exactly the same rules as
+    :func:`review` first (errors in branches the export does not use reject the
+    stitch too). The named downstream node must be a source, and the mapping
+    must cover exactly the source node's columns once each (no missing, no
+    extra); every target must exist on the upstream export node, while several
+    source columns may target the same upstream column.
+
+    The source is then replaced *in place* (same list position, same id, same
+    output column names in their original order) by a one-layer projection that
+    copies the mapped upstream export columns, so every downstream branch keeps
+    its references. Downstream's other nodes stay untouched, and only the
+    upstream export together with all of its dependency ancestors is appended —
+    in the nodes' original upstream order, with their original column
+    definitions; upstream nodes unreachable from its export stay behind.
+
+    An imported id clashing with a downstream id gets a unique
+    ``<id>__up[._n]`` replacement and every input reference inside the imported
+    closure is rewritten. The content and row influence at the replaced
+    position therefore come from the upstream export: the replaced source's
+    sensitive markings are not carried over, and the returned review reasons
+    use synthetic graph ids. The combined graph must stay within the
+    60-node cap or the whole request is rejected without a partial graph.
+    Neither input graph is mutated.
+    """
+    # Whole-graph validation of both inputs, exactly like /api/review.
+    _up_by_id, _up_order, up_relations = _evaluate_graph(request.upstream)
+    down_by_id, _down_order, _down_relations = _evaluate_graph(
+        request.downstream
+    )
+
+    source_id = request.source
+    source_node = down_by_id.get(source_id)
+    if not isinstance(source_node, SourceNodeIn):
+        raise ValidationError(
+            "STITCH_TARGET_NOT_SOURCE",
+            f"replacement target '{source_id}' does not exist in the "
+            "downstream graph or is not a source node",
+            source_id,
+        )
+
+    # The correspondence must cover exactly the source columns, once each.
+    source_names = [c.name for c in source_node.columns]
+    source_name_set = set(source_names)
+    mapped = {item.source_name: item.upstream_name for item in request.mapping}
+    extra = [
+        item.source_name
+        for item in request.mapping
+        if item.source_name not in source_name_set
+    ]
+    if extra:
+        raise ValidationError(
+            "STITCH_MAPPING_EXTRA",
+            "mapping lists column(s) the source node '"
+            f"{source_id}' does not have: " + ", ".join(extra),
+            source_id,
+            {"columns": extra},
+        )
+    missing = [name for name in source_names if name not in mapped]
+    if missing:
+        raise ValidationError(
+            "STITCH_MAPPING_MISSING",
+            "mapping does not cover every column of source node "
+            f"'{source_id}', missing: " + ", ".join(missing),
+            source_id,
+            {"columns": missing},
+        )
+
+    # Every target is resolved against the upstream export's actual columns.
+    upstream_export_id = request.upstream.export
+    upstream_columns = {c.name for c in up_relations[upstream_export_id].columns}
+    missing_targets = sorted(
+        {target for target in mapped.values() if target not in upstream_columns}
+    )
+    if missing_targets:
+        raise ValidationError(
+            "STITCH_UPSTREAM_COLUMN_NOT_FOUND",
+            "upstream export column(s) not found on export node "
+            f"'{upstream_export_id}': " + ", ".join(missing_targets),
+            upstream_export_id,
+            {"columns": missing_targets},
+        )
+
+    # Only the export and its full dependency closure travel over; in the
+    # upstream request's original node order.
+    keep = _ancestors(upstream_export_id, _up_by_id)
+    retained = [node for node in request.upstream.nodes if node.id in keep]
+
+    # The source is replaced, not added, so the combined size is downstream's
+    # nodes plus the retained upstream nodes.
+    combined_count = len(request.downstream.nodes) + len(retained)
+    if combined_count > NODE_LIMIT:
+        raise ValidationError(
+            "STITCH_NODE_LIMIT",
+            f"stitching would produce {combined_count} nodes, exceeding the "
+            f"{NODE_LIMIT}-node limit",
+            source_id,
+            {"node_count": combined_count, "limit": NODE_LIMIT},
+        )
+
+    # Imported ids must be globally unique in the combined graph.
+    used_ids = {node.id for node in request.downstream.nodes}
+    id_map: dict[str, str] = {}
+    for node in retained:
+        if node.id in used_ids:
+            new_id = _safe_imported_id(node.id, used_ids)
+        else:
+            new_id = node.id
+        id_map[node.id] = new_id
+        used_ids.add(new_id)
+
+    imported_dicts: list[dict[str, object]] = []
+    for node in retained:
+        data = serialize_node(node)
+        data["id"] = id_map[node.id]
+        if isinstance(node, (ProjectionNodeIn, FilterNodeIn)):
+            data["input"] = id_map[node.input]
+        elif isinstance(node, JoinNodeIn):
+            data["left_input"] = id_map[node.left_input]
+            data["right_input"] = id_map[node.right_input]
+        imported_dicts.append(data)
+
+    # Downstream nodes stay put; the source node is replaced in place by a
+    # one-layer projection keeping its id, output names and original order.
+    projection_columns = [
+        {"name": name, "copy": mapped[name]} for name in source_names
+    ]
+    downstream_dicts: list[dict[str, object]] = []
+    for node in request.downstream.nodes:
+        if node.id == source_id:
+            downstream_dicts.append(
+                {
+                    "id": source_id,
+                    "type": "projection",
+                    "input": id_map[upstream_export_id],
+                    "columns": projection_columns,
+                }
+            )
+        else:
+            downstream_dicts.append(serialize_node(node))
+
+    combined_nodes = downstream_dicts + imported_dicts
+
+    # Validate and review the constructed graph under the original rules. The
+    # review reasons naturally use synthetic (possibly renamed) graph ids.
+    composite_payload = ReviewRequest.model_validate(
+        {"nodes": combined_nodes, "export": request.downstream.export}
+    )
+    composite_review = review(composite_payload)
+
+    return {
+        "nodes": combined_nodes,
+        "export": request.downstream.export,
+        "source": source_id,
+        "upstream_export": id_map[upstream_export_id],
+        "imported_nodes": [
+            {"old_id": old_id, "new_id": id_map[old_id]}
+            for old_id in (node.id for node in retained)
+        ],
+        "review": composite_review,
     }

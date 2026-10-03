@@ -20,6 +20,10 @@
 原来的列（筛选引用随输入改名并继续透传；投影 `copy`、连接键与输出引用随各自输入改名，投影
 输出名与连接别名不变）。不增删任何节点或列，复审阻断结论不变，详见下文“源列批量改名”。
 
+此外提供 `POST /api/stitch`：把**上游加工图的导出接到下游图的某个源位置**，原位替换该源，
+仅追加上游导出及其全部依赖祖先，生成一张**可直接 POST 到 `/api/review` 复审**的合成图
+（ID 冲突时自动改成全图唯一 ID 并更新全部引用），详见下文“上下两图拼接”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -607,6 +611,170 @@ curl -s -i -X POST http://localhost:8080/api/rename \
 `renames` 为空/缺失、`from` 重复或为空字符串、`to` 为空、未知字段、节点超过 60 等 schema
 问题返回 HTTP 422。
 
+## 上下两图拼接：POST /api/stitch
+
+把**上游图的导出**接到**下游图的某个源节点位置**，原位替换该源，生成一张可复审的合成图。
+请求体包含两张**整图**（沿用 `/api/review` 全部校验）与一份列对应表：
+
+```jsonc
+{
+  "upstream":   {"nodes": [...], "export": "上游导出节点 ID"},
+  "downstream": {"nodes": [...], "export": "下游导出节点 ID"},
+  "source": "待替换的下游源节点 ID",
+  "mapping": [
+    {"from": "下游源列名", "to": "上游导出列名"}
+    // ... 每个下游源列恰好一项
+  ]
+}
+```
+
+### 对应表约束
+
+* `mapping` **非空**，每项 `from`、`to` 均非空；`from` 互异（重复为 422）；
+* 必须**恰好覆盖**待替换源节点的全部列、**无多余项**：
+  * 出现源节点没有的列：`STITCH_MAPPING_EXTRA`（400）；
+  * 漏掉源节点的列（按源列原序返回缺失列表）：`STITCH_MAPPING_MISSING`（400）；
+* 每个 `to` 必须是**上游导出节点实际输出的列名**（不是上游源列名）：
+  `STITCH_UPSTREAM_COLUMN_NOT_FOUND`（400）；
+* **允许多个源列引用同一个上游导出列**（一对多复制）。
+
+### 合成规则
+
+1. **两张整图先各自按原规则校验**（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
+   `INVALID_REFERENCE` / `CYCLE`，含导出不可达分支的错误，以及各自 60 节点上限）；
+   待替换目标必须存在于下游且为 `source`，否则 `STITCH_TARGET_NOT_SOURCE`（400）。
+2. **原位替换**：用**原源 ID 的一层投影**替换该源节点，位置、ID、输出列名与列顺序都不变——
+   按**源列原序**逐列 `copy` 对应表指向的上游导出列。因此下游该源的**所有分支引用**
+   （包括导出不用的分支、筛选、连接两侧）继续有效。下游其他节点**一律不动**。
+3. **只追加上游导出及其全部依赖祖先**：上游图中从导出不可达的节点不引入；引入节点按其在
+   **上游请求中的原序**追加在下游节点之后，节点内列/别名定义（含 `sensitive` 标记、常量、
+   筛选条件、连接配置）原样复制。
+4. **ID 冲突改名**：任一引入节点 ID 与下游冲突时，改成全图唯一 ID（`<原ID>__up`，再冲突
+   依次 `__up_2`、`__up_3`……），并同步改写引入闭包内的全部输入引用
+   （projection/filter 的 `input`、join 的 `left_input`/`right_input`）。
+   响应 `imported_nodes` 返回**全部引入节点**的 `old_id → new_id` 映射（按上游原序，
+   未改名的节点也在其中、新旧相同）；`upstream_export` 返回合成图中的上游导出 ID。
+5. **替换位置的内容与行影响取自上游**：新投影只复制上游导出列，**不保留被替换源的
+   `sensitive` 标记**——下游原源即使列敏感，替换后由上游导出列的实际来源决定。响应自带
+   `review`（对**原下游 export** 用原规则复审），其中原因一律使用**合成图 ID**
+   （冲突改名后的源节点显示为新 ID）。
+6. **不修改两份输入**（请求对象不被原地改动）；返回完整 `nodes`、**原下游 `export`**、
+   `source`、`upstream_export`、`imported_nodes` 与 `review`。
+7. **合成后节点数** = 下游节点数 + 引入的上游节点数（源是被替换、不是新增）；超过 60 时
+   `STITCH_NODE_LIMIT`（400，错误体含 `node_count`/`limit`）。
+
+以下情况均**整次拒绝、不返回部分图**：映射列不存在（多余/缺失/上游列不存在）、目标不是源、
+任一原图无效、合成后超过 60 节点。
+
+`mapping` 为空、`from` 重复或空字符串、`to` 为空、未知字段、两张子图自身超过 60 节点等
+schema 问题返回 HTTP 422。
+
+### 拼接并用 POST /api/review 复审（可直接执行）
+
+```bash
+# 1) 发起拼接（示例文件：把下游标记为敏感的 a/b/c 三列改由上游导出的 id/mail/region 供数）
+curl -s -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' \
+  --data @examples/stitch_request.json
+```
+
+返回（节选）：源 `ext` 在**原位**变成一层投影（ID 与列名/列序不变，`d_export` 对 `ext` 的
+引用无需改动）；下游其他节点不动；上游只引入 `u_users` 与其导出 `u_export`（无关节点不引入）；
+原源的敏感标记不再保留——`x`（接干净的 `id`）复审通过，`y`（接 `mail`）仍因上游
+`u_users.email` 阻断，原因使用合成图 ID：
+
+```json
+{
+  "nodes": [
+    {"id": "ext", "type": "projection", "input": "u_export", "columns": [
+      {"name": "a", "copy": "id"},
+      {"name": "b", "copy": "mail"},
+      {"name": "c", "copy": "region"}]},
+    {"id": "d_export", "type": "projection", "input": "ext", "columns": [
+      {"name": "x", "copy": "a"},
+      {"name": "y", "copy": "b"},
+      {"name": "z", "copy": "c"}]},
+    {"id": "u_users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email", "sensitive": true},
+      {"name": "country", "sensitive": false}]},
+    {"id": "u_export", "type": "projection", "input": "u_users", "columns": [
+      {"name": "id", "copy": "uid"},
+      {"name": "mail", "copy": "email"},
+      {"name": "region", "copy": "country"}]}
+  ],
+  "export": "d_export",
+  "source": "ext",
+  "upstream_export": "u_export",
+  "imported_nodes": [
+    {"old_id": "u_users", "new_id": "u_users"},
+    {"old_id": "u_export", "new_id": "u_export"}],
+  "review": {"export": "d_export", "blocked": true, "columns": [
+    {"name": "x", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "y", "blocked": true,
+     "content_reasons": [{"node_id": "u_users", "column": "email"}],
+     "row_reasons": []},
+    {"name": "z", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+```bash
+# 2) 用原审查接口 POST /api/review 复审返回的完整合成图（需要 jq）
+curl -s -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' \
+  --data @examples/stitch_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+# 与响应内 review 完全一致
+```
+
+ID 冲突示例：上下游都有 ID `s` 与 `e` 时，引入的上游节点改名为 `s__up`、`e__up`，其输入引用
+随之改写，复审原因也显示合成图 ID（`s__up`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "upstream": {
+    "nodes": [
+      {"id": "s", "type": "source", "columns": [{"name": "secret", "sensitive": true}]},
+      {"id": "e", "type": "projection", "input": "s",
+       "columns": [{"name": "secret", "copy": "secret"}]}],
+    "export": "e"},
+  "downstream": {
+    "nodes": [
+      {"id": "s", "type": "source", "columns": [{"name": "a"}]},
+      {"id": "e", "type": "projection", "input": "s",
+       "columns": [{"name": "a", "copy": "a"}]}],
+    "export": "e"},
+  "source": "s",
+  "mapping": [{"from": "a", "to": "secret"}]
+}'
+# upstream_export 为 "e__up"；review 的 content_reasons 为
+# [{"node_id": "s__up", "column": "secret"}]；imported_nodes 给出 s→s__up、e→e__up
+```
+
+多列引用同一上游列合法；映射缺列/多列/指向不存在的导出列、目标不是 source、任一原图无效或
+合成后超过 60 节点时均返回 400 且不带任何部分图。以示例文件为基础（需要 jq）：
+
+```bash
+# mapping 漏掉源列 "c" -> 400 STITCH_MAPPING_MISSING（columns 为 ["c"]，按源列原序）
+jq 'del(.mapping[2])' examples/stitch_request.json \
+| curl -s -i -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' --data @-
+
+# "to" 指向上游源列 "uid"（不是导出列）-> 400 STITCH_UPSTREAM_COLUMN_NOT_FOUND
+jq '.mapping[2].to = "uid"' examples/stitch_request.json \
+| curl -s -i -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' --data @-
+
+# 目标不是 source（或不存在）-> 400 STITCH_TARGET_NOT_SOURCE
+jq '.source = "d_export"' examples/stitch_request.json \
+| curl -s -i -X POST http://localhost:8080/api/stitch \
+  -H 'Content-Type: application/json' --data @-
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -642,11 +810,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest 与 RenameRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简与源列批量改名
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简与改名测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、StitchRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下两图拼接
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/stitch、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、stitch_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名与拼接测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```

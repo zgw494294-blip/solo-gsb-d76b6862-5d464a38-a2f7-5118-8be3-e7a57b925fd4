@@ -1,0 +1,56 @@
+{
+  "upstream": {
+    "nodes": [
+      {
+        "id": "u_users",
+        "type": "source",
+        "columns": [
+          {"name": "uid", "sensitive": false},
+          {"name": "email", "sensitive": true},
+          {"name": "country", "sensitive": false}
+        ]
+      },
+      {
+        "id": "u_export",
+        "type": "projection",
+        "input": "u_users",
+        "columns": [
+          {"name": "id", "copy": "uid"},
+          {"name": "mail", "copy": "email"},
+          {"name": "region", "copy": "country"}
+        ]
+      }
+    ],
+    "export": "u_export"
+  },
+  "downstream": {
+    "nodes": [
+      {
+        "id": "ext",
+        "type": "source",
+        "columns": [
+          {"name": "a", "sensitive": true},
+          {"name": "b", "sensitive": true},
+          {"name": "c", "sensitive": true}
+        ]
+      },
+      {
+        "id": "d_export",
+        "type": "projection",
+        "input": "ext",
+        "columns": [
+          {"name": "x", "copy": "a"},
+          {"name": "y", "copy": "b"},
+          {"name": "z", "copy": "c"}
+        ]
+      }
+    ],
+    "export": "d_export"
+  },
+  "source": "ext",
+  "mapping": [
+    {"from": "a", "to": "id"},
+    {"from": "b", "to": "mail"},
+    {"from": "c", "to": "region"}
+  ]
+}
